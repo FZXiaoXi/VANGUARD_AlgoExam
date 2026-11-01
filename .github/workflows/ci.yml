@@ -1,0 +1,454 @@
+name: Pull Request CI
+
+on:
+  pull_request_target:
+    branches:
+      - main
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - ready_for_review
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: pull-request-ci-${{ github.repository }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  close-previous:
+    name: Close previous exam PRs
+    if: ${{ github.event.action == 'opened' }}
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Close older open PRs from this candidate
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          CURRENT_PR: ${{ github.event.pull_request.number }}
+          CURRENT_CREATED_AT: ${{ github.event.pull_request.created_at }}
+          CURRENT_AUTHOR: ${{ github.event.pull_request.user.login }}
+          CURRENT_HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
+          BASE_BRANCH: ${{ github.event.pull_request.base.ref }}
+        run: |
+          set -euo pipefail
+
+          # Only inspect PR metadata. No pull request source or workflow is executed.
+          gh api \
+            --paginate \
+            --slurp \
+            "repos/${REPOSITORY}/pulls?state=open&base=${BASE_BRANCH}&per_page=100" \
+            > "${RUNNER_TEMP}/open-pull-requests.json"
+
+          mapfile -t previous_prs < <(
+            jq -r \
+              --arg current_pr "${CURRENT_PR}" \
+              --arg current_created_at "${CURRENT_CREATED_AT}" \
+              --arg current_author "${CURRENT_AUTHOR}" \
+              --arg current_head_repository "${CURRENT_HEAD_REPOSITORY}" \
+              '
+                .[][]
+                | select((.number | tostring) != $current_pr)
+                | select(.user.login == $current_author)
+                | select(.head.repo != null and .head.repo.full_name == $current_head_repository)
+                | select(
+                    (.created_at < $current_created_at)
+                    or (.created_at == $current_created_at and .number < ($current_pr | tonumber))
+                  )
+                | .number | tostring
+              ' \
+              "${RUNNER_TEMP}/open-pull-requests.json"
+          )
+
+          if ((${#previous_prs[@]} == 0)); then
+            echo "No previous open PR from this candidate repository was found."
+            exit 0
+          fi
+
+          for pr_number in "${previous_prs[@]}"; do
+            [[ -z "${pr_number}" ]] && continue
+            echo "Closing previous candidate PR #${pr_number}."
+            gh api \
+              --method PATCH \
+              "repos/${REPOSITORY}/pulls/${pr_number}" \
+              -f state=closed \
+              --silent
+          done
+
+          echo "Previous candidate PR cleanup completed."
+
+  environment:
+    name: Environment preparation
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    env:
+      ROS_IMAGE: ros:humble-ros-base-jammy
+    steps:
+      - name: Restore ROS metadata cache
+        uses: actions/cache@v4
+        with:
+          path: .ci-cache/ros-home
+          key: ${{ runner.os }}-ros-humble-rosdep-v2
+
+      - name: Prepare and verify ROS 2 Humble container
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ros_cache_dir="${GITHUB_WORKSPACE}/.ci-cache/ros-home"
+          mkdir -p "${ros_cache_dir}"
+
+          echo "Pulling official ROS image: ${ROS_IMAGE}"
+          docker pull "${ROS_IMAGE}"
+
+          docker run --rm \
+            --user "$(id -u):$(id -g)" \
+            --env HOME=/tmp/ros-home \
+            --env ROS_HOME=/tmp/ros-home/.ros \
+            --volume "${ros_cache_dir}:/tmp/ros-home/.ros:rw" \
+            "${ROS_IMAGE}" \
+            bash -lc '
+              set -eo pipefail
+              set +u
+              source /opt/ros/humble/setup.bash
+              set -u
+
+              echo "Container OS:"
+              cat /etc/os-release | sed -n "1,5p"
+              echo "ROS_DISTRO=${ROS_DISTRO}"
+              echo "ros2=$(command -v ros2)"
+              echo "colcon=$(command -v colcon)"
+              echo "rosdep=$(command -v rosdep)"
+              ros2 pkg prefix rclcpp
+
+              cache_file="${ROS_HOME}/rosdep/sources.cache/index-v4.yaml"
+              update_stamp="${ROS_HOME}/rosdep/.update-complete"
+              if [[ ! -f "${cache_file}" || ! -f "${update_stamp}" ]]; then
+                echo "ROS dependency metadata cache is empty; updating it."
+                rosdep update --rosdistro humble
+                touch "${update_stamp}"
+              else
+                echo "Using cached ROS dependency metadata."
+              fi
+            '
+
+          echo "Runner: $(uname -a)"
+          echo "Python: $(python3 --version 2>&1 || true)"
+          echo "CMake: $(cmake --version 2>&1 | head -n 1 || true)"
+          echo "Git: $(git --version 2>&1 || true)"
+          echo "ROS 2 Humble environment preparation completed."
+
+  debug-1:
+    name: Debug 1 tests
+    needs: environment
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    env:
+      ROS_IMAGE: ros:humble-ros-base-jammy
+      TEST_SCRIPT_REPOSITORY: FZ-XiaoXi/VANGUARD_AlgoExam_TestScript
+      DEBUG1_CONTAINER: debug1-ci
+    steps:
+      - name: Checkout pull request source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          # This workflow intentionally tests fork code in an isolated ROS
+          # container while using pull_request_target for PR management and
+          # access to the private test-script repository.
+          allow-unsafe-pr-checkout: true
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Checkout private test scripts
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.TEST_SCRIPT_REPOSITORY }}
+          ref: main
+          token: ${{ secrets.VANGUARD_TESTSCRIPT_READ_TOKEN }}
+          path: .ci-test-scripts
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Restore ROS metadata cache
+        uses: actions/cache@v4
+        with:
+          path: .ci-cache/ros-home
+          key: ${{ runner.os }}-ros-humble-rosdep-v2
+
+      - name: Prepare shared Debug 1 ROS container
+        id: prepare_debug_1
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ros_cache_dir="${GITHUB_WORKSPACE}/.ci-cache/ros-home"
+          mkdir -p "${ros_cache_dir}"
+
+          echo "Pulling official ROS image: ${ROS_IMAGE}"
+          docker pull "${ROS_IMAGE}"
+          docker rm -f "${DEBUG1_CONTAINER}" >/dev/null 2>&1 || true
+          docker run -d \
+            --name "${DEBUG1_CONTAINER}" \
+            --env HOME=/tmp/ros-home \
+            --env ROS_HOME=/tmp/ros-home/.ros \
+            --env CCACHE_DISABLE=1 \
+            --volume "${GITHUB_WORKSPACE}/Debug_1:/workspace/Debug_1:rw" \
+            --volume "${ros_cache_dir}:/tmp/ros-home/.ros:rw" \
+            --workdir /workspace/Debug_1 \
+            "${ROS_IMAGE}" \
+            bash -lc 'sleep infinity'
+
+      - name: Debug 1 test 1 - build messages_cpp
+        id: debug_1_test_1
+        if: ${{ always() && steps.prepare_debug_1.outcome == 'success' }}
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          test_script="${GITHUB_WORKSPACE}/.ci-test-scripts/Debug_1/test_debug_1.sh"
+          test -s "${test_script}"
+          docker exec -i "${DEBUG1_CONTAINER}" bash -lc '
+            set -eo pipefail
+            set +u
+            source /opt/ros/humble/setup.bash
+            set -u
+            cache_file="${ROS_HOME}/rosdep/sources.cache/index-v4.yaml"
+            update_stamp="${ROS_HOME}/rosdep/.update-complete"
+            if [[ ! -f "${cache_file}" || ! -f "${update_stamp}" ]]; then
+              rosdep update --rosdistro humble
+              touch "${update_stamp}"
+            fi
+            rosdep install --from-paths /workspace/Debug_1/src --ignore-src --rosdistro humble --default-yes -r
+            bash -s -- /workspace/Debug_1 messages_cpp
+          ' < "${test_script}"
+
+      - name: Debug 1 test 2 - build messages_publisher
+        id: debug_1_test_2
+        if: ${{ always() && steps.prepare_debug_1.outcome == 'success' }}
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          test_script="${GITHUB_WORKSPACE}/.ci-test-scripts/Debug_1/test_debug_1.sh"
+          test -s "${test_script}"
+          docker exec -i "${DEBUG1_CONTAINER}" bash -lc '
+            set -eo pipefail
+            set +u
+            source /opt/ros/humble/setup.bash
+            set -u
+            rosdep install --from-paths /workspace/Debug_1/src --ignore-src --rosdistro humble --default-yes -r
+            bash -s -- /workspace/Debug_1 messages_publisher
+          ' < "${test_script}"
+
+      - name: Debug 1 test 3 - build messages_subscriber
+        id: debug_1_test_3
+        if: ${{ always() && steps.prepare_debug_1.outcome == 'success' }}
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          test_script="${GITHUB_WORKSPACE}/.ci-test-scripts/Debug_1/test_debug_1.sh"
+          test -s "${test_script}"
+          docker exec -i "${DEBUG1_CONTAINER}" bash -lc '
+            set -eo pipefail
+            set +u
+            source /opt/ros/humble/setup.bash
+            set -u
+            rosdep install --from-paths /workspace/Debug_1/src --ignore-src --rosdistro humble --default-yes -r
+            bash -s -- /workspace/Debug_1 messages_subscriber
+          ' < "${test_script}"
+
+      - name: Debug 1 test 4 - subscriber startup output
+        id: debug_1_test_4
+        if: ${{ always() && steps.prepare_debug_1.outcome == 'success' }}
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          test_script="${GITHUB_WORKSPACE}/.ci-test-scripts/Debug_1/test_debug_1.sh"
+          test -s "${test_script}"
+          docker exec -i "${DEBUG1_CONTAINER}" bash -lc '
+            set -eo pipefail
+            set +u
+            source /opt/ros/humble/setup.bash
+            set -u
+            bash -s -- /workspace/Debug_1 subscriber_startup
+          ' < "${test_script}"
+
+      - name: Debug 1 test 5 - publisher configuration output
+        id: debug_1_test_5
+        if: ${{ always() && steps.prepare_debug_1.outcome == 'success' }}
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          test_script="${GITHUB_WORKSPACE}/.ci-test-scripts/Debug_1/test_debug_1.sh"
+          test -s "${test_script}"
+          docker exec -i "${DEBUG1_CONTAINER}" bash -lc '
+            set -eo pipefail
+            set +u
+            source /opt/ros/humble/setup.bash
+            set -u
+            bash -s -- /workspace/Debug_1 publisher_config
+          ' < "${test_script}"
+
+      - name: Debug 1 test 6 - publisher and subscriber exchange
+        id: debug_1_test_6
+        if: ${{ always() && steps.prepare_debug_1.outcome == 'success' }}
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          test_script="${GITHUB_WORKSPACE}/.ci-test-scripts/Debug_1/test_debug_1.sh"
+          test -s "${test_script}"
+          docker exec -i "${DEBUG1_CONTAINER}" bash -lc '
+            set -eo pipefail
+            set +u
+            source /opt/ros/humble/setup.bash
+            set -u
+            bash -s -- /workspace/Debug_1 message_exchange
+          ' < "${test_script}"
+
+      - name: Report Debug 1 test results
+        if: ${{ always() }}
+        env:
+          PREPARE_RESULT: ${{ steps.prepare_debug_1.outcome }}
+          TEST_1_RESULT: ${{ steps.debug_1_test_1.outcome }}
+          TEST_2_RESULT: ${{ steps.debug_1_test_2.outcome }}
+          TEST_3_RESULT: ${{ steps.debug_1_test_3.outcome }}
+          TEST_4_RESULT: ${{ steps.debug_1_test_4.outcome }}
+          TEST_5_RESULT: ${{ steps.debug_1_test_5.outcome }}
+          TEST_6_RESULT: ${{ steps.debug_1_test_6.outcome }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo "## Debug 1 test results"
+            echo
+            echo "| Test | Result |"
+            echo "| --- | --- |"
+            echo "| Environment preparation | ${PREPARE_RESULT} |"
+            echo "| Build messages_cpp | ${TEST_1_RESULT} |"
+            echo "| Build messages_publisher | ${TEST_2_RESULT} |"
+            echo "| Build messages_subscriber | ${TEST_3_RESULT} |"
+            echo "| Subscriber startup output | ${TEST_4_RESULT} |"
+            echo "| Publisher configuration output | ${TEST_5_RESULT} |"
+            echo "| Publisher/subscriber exchange | ${TEST_6_RESULT} |"
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+          overall_result=success
+          for result in "${PREPARE_RESULT}" "${TEST_1_RESULT}" "${TEST_2_RESULT}" "${TEST_3_RESULT}" "${TEST_4_RESULT}" "${TEST_5_RESULT}" "${TEST_6_RESULT}"; do
+            if [[ "${result}" != "success" ]]; then
+              overall_result=failure
+            fi
+          done
+          if [[ "${overall_result}" != "success" ]]; then
+            echo "One or more Debug_1 tests failed."
+            exit 1
+          fi
+          echo "All Debug_1 tests passed."
+
+      - name: Cleanup Debug 1 ROS container
+        if: ${{ always() }}
+        shell: bash
+        run: docker rm -f "${DEBUG1_CONTAINER}" >/dev/null 2>&1 || true
+
+  debug-2:
+    name: Debug 2 tests
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    env:
+      TEST_SCRIPT_REPOSITORY: FZ-XiaoXi/VANGUARD_AlgoExam_TestScript
+    steps:
+      - name: Checkout pull request source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          # Keep the same explicit opt-in for the non-ROS Debug 2 job.
+          allow-unsafe-pr-checkout: true
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Checkout private test scripts
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.TEST_SCRIPT_REPOSITORY }}
+          ref: main
+          token: ${{ secrets.VANGUARD_TESTSCRIPT_READ_TOKEN }}
+          path: .ci-test-scripts
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Run private Debug 2 test script
+        id: debug_2_tests
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test_script="${GITHUB_WORKSPACE}/.ci-test-scripts/Debug_2/test_debug_2.sh"
+          test -s "${test_script}"
+          bash -s -- "${GITHUB_WORKSPACE}/Debug_2" < "${test_script}"
+
+      - name: Report Debug 2 test result
+        if: ${{ always() }}
+        env:
+          TEST_RESULT: ${{ steps.debug_2_tests.outcome }}
+        run: |
+          {
+            echo "## Debug 2 test script result"
+            echo
+            echo "| Test script | Result |"
+            echo "| --- | --- |"
+            echo "| Private Debug_2 script | ${TEST_RESULT} |"
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+  ci-summary:
+    name: CI summary
+    needs:
+      - environment
+      - debug-1
+      - debug-2
+    if: ${{ always() }}
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Require all CI stages to pass
+        shell: bash
+        env:
+          ENVIRONMENT_RESULT: ${{ needs.environment.result }}
+          DEBUG_1_RESULT: ${{ needs.debug-1.result }}
+          DEBUG_2_RESULT: ${{ needs.debug-2.result }}
+        run: |
+          set -euo pipefail
+
+          echo "Environment: ${ENVIRONMENT_RESULT}"
+          echo "Debug 1: ${DEBUG_1_RESULT}"
+          echo "Debug 2: ${DEBUG_2_RESULT}"
+
+          overall_result=success
+          for result in "${ENVIRONMENT_RESULT}" "${DEBUG_1_RESULT}" "${DEBUG_2_RESULT}"; do
+            if [[ "${result}" != "success" ]]; then
+              overall_result=failure
+            fi
+          done
+
+          {
+            echo "## Final CI result"
+            echo
+            echo "| Stage | Result |"
+            echo "| --- | --- |"
+            echo "| Environment preparation | ${ENVIRONMENT_RESULT} |"
+            echo "| Debug 1 tests | ${DEBUG_1_RESULT} |"
+            echo "| Debug 2 tests | ${DEBUG_2_RESULT} |"
+            echo "| **Overall** | **${overall_result}** |"
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+          if [[ "${overall_result}" != "success" ]]; then
+            echo "CI summary failed because a required stage did not pass."
+            exit 1
+          fi
+
+          echo "All CI stages passed."
